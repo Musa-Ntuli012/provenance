@@ -1,0 +1,27 @@
+# Dependency and action updates (DEVELOPER-coding-standards.md §2 A06).
+# Weekly cadence; groups minor/patch bumps so PRs stay reviewable.
+
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /backend
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

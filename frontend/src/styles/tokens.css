@@ -1,0 +1,93 @@
+/* =========================================================================
+   PROVENANCE design tokens, Atlas Sahara palette, Apple-style materials.
+
+   Principles applied (Apple WWDC design talks, via emilkowalski/skills):
+   · Size-specific tracking, negative on display text, ~0 on body
+   · Weight+size+leading as a set for hierarchy
+   · Translucent materials encode hierarchy (nav heavier, chrome lighter)
+   · Motion is interruptible, ease-out on enter, mirrored on exit
+   · Reduced motion / transparency / contrast each get a real fallback
+   ========================================================================= */
+
+:root {
+  /* Palette, Atlas Sahara */
+  --terracotta: #c0642c;
+  --terracotta-deep: #a5541f;
+  --terracotta-tint: rgba(192, 100, 44, 0.1);
+  --gold: #b89040;
+  --gold-tint: rgba(184, 144, 64, 0.14);
+  --sage: #5e7d66;
+  --sage-tint: rgba(94, 125, 102, 0.12);
+  --clay: #a94438;
+  --clay-tint: rgba(169, 68, 56, 0.1);
+
+  --paper: #f3ede1;          /* app ground, warm sand */
+  --card: #fffdf8;           /* raised surface, bone */
+  --card-2: #faf6ec;
+  --well: #ece4d4;           /* recessed wells */
+  --ink: #251c12;
+  --ink-2: #5d5244;
+  --ink-3: #94887430;
+  --ink-3-solid: #938773;
+  --line: rgba(62, 46, 27, 0.12);
+  --line-strong: rgba(62, 46, 27, 0.22);
+  --on-terracotta: #fff7ef;
+
+  /* Materials (Apple: translucency conveys hierarchy) */
+  --material-nav: rgba(249, 245, 236, 0.78);
+  --material-chrome: rgba(252, 249, 242, 0.66);
+  --material-scrim: rgba(38, 26, 14, 0.42);
+  --blur-nav: 28px;
+  --blur-chrome: 16px;
+
+  /* Type */
+  --font-display: 'DM Serif Display', 'Times New Roman', serif;
+  --font-editorial: 'Cormorant Garamond', Georgia, serif;
+  --font-ui: 'Montserrat', -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'DM Mono', ui-monospace, 'SF Mono', monospace;
+
+  --text-xs: 11px;
+  --text-sm: 12.5px;
+  --text-base: 14px;
+  --text-md: 15.5px;
+  --text-lg: 18px;
+  --text-xl: 24px;
+  --text-2xl: 30px;
+  --text-display: clamp(30px, 4.4vw, 42px);
+
+  /* Space, 4px grid */
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px;
+  --s6: 32px; --s7: 48px; --s8: 64px;
+
+  /* Radii, soft, continuous-corner feel */
+  --r-xl: 20px;
+  --r-lg: 14px;
+  --r-md: 10px;
+  --r-sm: 8px;
+  --r-pill: 999px;
+
+  /* Elevation, layered, warm-tinted shadows */
+  --shadow-1: 0 1px 2px rgba(45, 30, 15, 0.05), 0 6px 20px rgba(45, 30, 15, 0.05);
+  --shadow-2: 0 2px 4px rgba(45, 30, 15, 0.06), 0 16px 40px rgba(45, 30, 15, 0.12);
+  --shadow-3: 0 32px 80px rgba(35, 22, 10, 0.24);
+  --ring: 0 0 0 3px rgba(192, 100, 44, 0.28);
+
+  /* Motion, enter/exit mirrored, ease-out dominant */
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);
+  --t-fast: 120ms;
+  --t-med: 240ms;
+  --t-slow: 420ms;
+
+  --sidebar-w: 250px;
+  --topbar-h: 60px;
+  --content-max: 1280px;
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --material-nav: #f7f3ea;
+    --material-chrome: #fbf8f1;
+    --blur-nav: 0px;
+    --blur-chrome: 0px;
+  }
+}

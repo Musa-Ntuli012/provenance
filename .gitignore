@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# Build artefacts
+frontend/dist/
+backend/storage/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Local database data (embedded/docker volumes)
+.pgdata/

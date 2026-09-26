@@ -1,0 +1,33 @@
+# Local development database for PROVENANCE (MongoDB 7).
+#
+# Usage:
+#   docker compose up -d
+#   cd backend && cp .env.example .env   # fill in JWT_SECRET
+#   npm run db:setup
+#
+# Transactions (used for every mutating request, so changes and their audit
+# entries commit together) require a replica set, so this runs mongod as a
+# single-node replica set and initiates it automatically on first health
+# check. The published member is localhost:27017, which is what the backend
+# .env connects to on the same machine.
+#
+# NOTE: this development database runs without authentication for zero
+# friction on a laptop. Keep the port private (do not publish it on a network)
+# and use MongoDB Atlas or an auth-enabled deployment for anything shared.
+services:
+  db:
+    image: mongo:7
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "${MONGO_HOST_PORT:-27017}:27017"
+    volumes:
+      - mongodata:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'try { rs.status() } catch (e) { rs.initiate({_id: \"rs0\", members: [{_id: 0, host: \"localhost:27017\"}]}) }' >/dev/null && mongosh --quiet --eval 'db.adminCommand({hello: 1}).isWritablePrimary' | grep -q true"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  mongodata:
