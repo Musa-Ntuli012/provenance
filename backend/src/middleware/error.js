@@ -19,6 +19,27 @@ export function errorHandler(err, req, res, _next) {
     });
   }
 
+  // Missing schema: the API was started before migrations ran.
+  if (err?.code === '42P01') {
+    log('ERROR', '500 SCHEMA_NOT_INITIALIZED (run: npm run db:setup)');
+    return res.status(500).json({
+      error: {
+        code: 'SCHEMA_NOT_INITIALIZED',
+        message: 'The database schema is not initialized. Stop the API and run: npm run db:setup',
+      },
+    });
+  }
+  // The runtime role lacks its grants (bootstrap not run on this database).
+  if (err?.code === '42501') {
+    log('ERROR', '500 DB_PERMISSION (run: APP_ROLE_PASSWORD=... npm run db:bootstrap)');
+    return res.status(500).json({
+      error: {
+        code: 'DB_PERMISSION',
+        message: 'The runtime database role is missing permissions. Run: APP_ROLE_PASSWORD=<runtime password> npm run db:bootstrap',
+      },
+    });
+  }
+
   // Multer size/type failures surface as generic errors, treat as bad input.
   if (err?.code === 'LIMIT_FILE_SIZE') {
     return res.status(400).json({

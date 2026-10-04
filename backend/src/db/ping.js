@@ -9,7 +9,14 @@ import { config } from '../config.js';
 
 const masked = (uri) => uri.replace(/:\/\/([^:/@]+):[^@]*@/, '://$1:****@');
 
+const authority = config.databaseUrl.split('://')[1]?.split('/')[0] ?? '';
+const rawAt = (authority.match(/@/g) ?? []).length > 1;
+
 try {
+  if (rawAt) {
+    console.log('warning    : the URI password contains raw @ characters. The driver copes,');
+    console.log('             other tools may not: URL-encode them (@ becomes %40).');
+  }
   const client = new pg.Client({ connectionString: config.databaseUrl, ssl: config.dbSsl });
   await client.connect();
   const { rows } = await client.query('select version(), current_database(), current_user');

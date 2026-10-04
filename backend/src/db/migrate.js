@@ -35,6 +35,13 @@ async function migrate() {
     } catch (err) {
       await admin.query('ROLLBACK');
       console.error(`FAILED   ${file}: ${err.message}`);
+      if (err?.message?.includes('role "provenance_app" does not exist')) {
+        console.error('');
+        console.error('The runtime role does not exist on this database yet. Create it once with:');
+        console.error('  PowerShell:  $env:APP_ROLE_PASSWORD="pick-a-password-123"; npm run db:bootstrap');
+        console.error('  bash:        APP_ROLE_PASSWORD=pick-a-password-123 npm run db:bootstrap');
+        console.error('then follow the DATABASE_URL it prints and run: npm run db:setup');
+      }
       process.exitCode = 1;
       break;
     }

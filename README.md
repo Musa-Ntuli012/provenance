@@ -244,7 +244,10 @@ provenance/
 | `no pg_hba.conf entry ... no encryption` | TLS required: use the Supabase **session pooler** URI; TLS is applied automatically for non-localhost hosts |
 | Supabase connection times out | Network access: allow your IP in the dashboard; prefer the session pooler URI (IPv4-compatible) over the direct one (IPv6-only on free plans) |
 | `relation "tenants" does not exist` | Run `npm run db:migrate` |
-| `role "provenance_app" does not exist` at migrate | Run `APP_ROLE_PASSWORD=... npm run db:bootstrap` first (or create the role in the Supabase SQL editor) |
+| Register or any write returns `SCHEMA_NOT_INITIALIZED` (500) | The API started before migrations ran: stop it, `npm run db:setup`, start again (the API also refuses to boot in this state) |
+| Any write returns `DB_PERMISSION` (500) | The runtime role lacks grants: `APP_ROLE_PASSWORD=... npm run db:bootstrap` |
+| `role "provenance_app" does not exist` at migrate | Create the runtime role once. PowerShell: `$env:APP_ROLE_PASSWORD="pick-a-password-123"; npm run db:bootstrap`, then set `DATABASE_URL` to the URI it prints and run `npm run db:setup` |
+| Supabase password contains `@` | URL-encode it in the URIs (`@` becomes `%40`); `db:ping` warns when it is raw |
 | Login returns *Invalid workspace, email or password* | Workspace is `mbe-demo`; reseed with `npm run db:seed` |
 | `JWT_SECRET must be at least 32 characters` | Set a real secret: `openssl rand -hex 48` |
 | Port 4000/5173 busy | `PORT=4001 npm run dev` (backend) / `npm run dev -- --port 5174` (frontend) |
