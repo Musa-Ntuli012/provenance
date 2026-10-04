@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { withTenant, withTenantTx, isDuplicateKey, toRow } from '../db/mongo.js';
+import { withTenant } from '../db/pool.js';
 import { audit } from '../lib/audit.js';
 import { conflict, notFound } from '../lib/errors.js';
 import { uuidField } from '../lib/fields.js';
@@ -41,18 +41,14 @@ financeRouter.get('/projects/:id/certificates', requireCapability('finance.read'
   try {
     const rows = await withTenant(req.user.tenantId, async (db) => {
       await loadProject(db, req.user, req.params.id);
-      const certs = await db.coll('payment_certificates').find(
-        { project_id: req.params.id },
-        { sort: { period_end: -1, created_at: -1 } },
+      return db.query(
+        `SELECT pc.*, u.full_name AS endorsed_by_name
+           FROM payment_certificates pc LEFT JOIN users u ON u.id = pc.endorsed_by
+          WHERE pc.project_id = $1 ORDER BY pc.period_end DESC, pc.created_at DESC`,
+        [req.params.id],
       );
-      const endorserIds = [...new Set(certs.map((c) => c.endorsed_by).filter(Boolean))];
-      const endorsers = endorserIds.length
-        ? await db.coll('users').find({ _id: { $in: endorserIds } }, { projection: { _id: 1, full_name: 1 } })
-        : [];
-      const uMap = new Map(endorsers.map((u) => [u._id, u.full_name]));
-      return certs.map((c) => ({ ...toRow(c), endorsed_by_name: c.endorsed_by ? (uMap.get(c.endorsed_by) ?? null) : null }));
     });
-    res.json({ certificates: rows });
+    res.json({ certificates: rows.rows });
   } catch (err) {
     next(err);
   }
@@ -66,46 +62,37 @@ financeRouter.post(
     const { id } = req.data.params;
     const b = req.data.body;
     try {
-      const row = await withTenantTx(req.user.tenantId, async (db) => {
+      const row = await withTenant(req.user.tenantId, async (db) => {
         await loadProject(db, req.user, id);
-        const doc = await db.coll('payment_certificates').insertOne({
-          project_id: id,
-          certificate_no: b.certificateNo,
-          period_start: b.periodStart,
-          period_end: b.periodEnd,
-          gross_value: money2(b.grossValue),
-          deductions: money2(b.deductions),
-          status: 'DRAFT',
-          domain: b.domain,
-          endorsed_by: null,
-          endorsed_at: null,
-          certified_at: null,
-          created_by: req.user.id,
-          created_at: new Date(),
-        });
+        const r = await db.query(
+          `INSERT INTO payment_certificates
+             (project_id, certificate_no, period_start, period_end, gross_value, deductions, domain, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+          [id, b.certificateNo, b.periodStart, b.periodEnd, money2(b.grossValue), money2(b.deductions), b.domain, req.user.id],
+        );
         await audit(db, {
           actorId: req.user.id,
           actorRole: req.user.role,
           action: 'certificate.created',
           entity: 'payment_certificate',
-          entityId: doc._id,
+          entityId: r.rows[0].id,
           summary: `Payment certificate ${b.certificateNo} raised (${b.grossValue.toFixed(2)} gross)`,
           detail: b,
         });
-        return doc;
+        return r.rows[0];
       });
-      res.status(201).json({ certificate: toRow(row) });
+      res.status(201).json({ certificate: row });
     } catch (err) {
-      if (isDuplicateKey(err)) return next(conflict('That certificate number already exists on this project'));
+      if (err?.code === '23505') return next(conflict('That certificate number already exists on this project'));
       next(err);
     }
   },
 );
 
 async function loadCertificate(db, certificateId) {
-  const cert = await db.coll('payment_certificates').findOne({ _id: certificateId });
-  if (!cert) throw notFound('Certificate not found');
-  return cert;
+  const r = await db.query('SELECT * FROM payment_certificates WHERE id = $1', [certificateId]);
+  if (r.rowCount === 0) throw notFound('Certificate not found');
+  return r.rows[0];
 }
 
 const endorseCertSchema = z.object({
@@ -119,7 +106,7 @@ financeRouter.post(
   validate(endorseCertSchema),
   async (req, res, next) => {
     try {
-      const row = await withTenantTx(req.user.tenantId, async (db) => {
+      const row = await withTenant(req.user.tenantId, async (db) => {
         const cert = await loadCertificate(db, req.data.params.id);
         if (cert.status !== 'DRAFT') throw conflict(`Certificate is already ${cert.status.toLowerCase()}`);
         // Domain-scoped: leads endorse only their own domain's records.
@@ -127,22 +114,22 @@ financeRouter.post(
           throw notFound('Certificate not found');
         }
         const status = req.data.body.decision === 'ENDORSED' ? 'ENDORSED' : 'REJECTED';
-        const doc = await db.coll('payment_certificates').findOneAndUpdate(
-          { _id: cert._id },
-          { $set: { status, endorsed_by: req.user.id, endorsed_at: new Date() } },
-          { returnDocument: 'after' },
+        const r = await db.query(
+          `UPDATE payment_certificates SET status = $2, endorsed_by = $3, endorsed_at = now()
+            WHERE id = $1 RETURNING *`,
+          [cert.id, status, req.user.id],
         );
         await audit(db, {
           actorId: req.user.id,
           actorRole: req.user.role,
           action: status === 'ENDORSED' ? 'certificate.endorsed' : 'certificate.rejected',
           entity: 'payment_certificate',
-          entityId: cert._id,
+          entityId: cert.id,
           summary: `Payment certificate ${cert.certificate_no} ${status.toLowerCase()}`,
         });
-        return doc;
+        return r.rows[0];
       });
-      res.json({ certificate: toRow(row) });
+      res.json({ certificate: row });
     } catch (err) {
       next(err);
     }
@@ -155,25 +142,24 @@ financeRouter.post(
   validate(z.object({ params: z.object({ id: uuidField }) })),
   async (req, res, next) => {
     try {
-      const row = await withTenantTx(req.user.tenantId, async (db) => {
+      const row = await withTenant(req.user.tenantId, async (db) => {
         const cert = await loadCertificate(db, req.data.params.id);
         if (cert.status !== 'ENDORSED') throw conflict('Only an endorsed certificate can be certified');
-        const doc = await db.coll('payment_certificates').findOneAndUpdate(
-          { _id: cert._id },
-          { $set: { status: 'CERTIFIED', certified_at: new Date() } },
-          { returnDocument: 'after' },
+        const r = await db.query(
+          `UPDATE payment_certificates SET status = 'CERTIFIED', certified_at = now() WHERE id = $1 RETURNING *`,
+          [cert.id],
         );
         await audit(db, {
           actorId: req.user.id,
           actorRole: req.user.role,
           action: 'certificate.certified',
           entity: 'payment_certificate',
-          entityId: cert._id,
+          entityId: cert.id,
           summary: `Payment certificate ${cert.certificate_no} certified`,
         });
-        return doc;
+        return r.rows[0];
       });
-      res.json({ certificate: toRow(row) });
+      res.json({ certificate: row });
     } catch (err) {
       next(err);
     }
@@ -196,18 +182,14 @@ financeRouter.get('/projects/:id/variation-orders', requireCapability('finance.r
   try {
     const rows = await withTenant(req.user.tenantId, async (db) => {
       await loadProject(db, req.user, req.params.id);
-      const vos = await db.coll('variation_orders').find(
-        { project_id: req.params.id },
-        { sort: { created_at: -1 } },
+      return db.query(
+        `SELECT vo.*, u.full_name AS endorsed_by_name FROM variation_orders vo
+           LEFT JOIN users u ON u.id = vo.endorsed_by
+          WHERE vo.project_id = $1 ORDER BY vo.created_at DESC`,
+        [req.params.id],
       );
-      const endorserIds = [...new Set(vos.map((v) => v.endorsed_by).filter(Boolean))];
-      const endorsers = endorserIds.length
-        ? await db.coll('users').find({ _id: { $in: endorserIds } }, { projection: { _id: 1, full_name: 1 } })
-        : [];
-      const uMap = new Map(endorsers.map((u) => [u._id, u.full_name]));
-      return vos.map((v) => ({ ...toRow(v), endorsed_by_name: v.endorsed_by ? (uMap.get(v.endorsed_by) ?? null) : null }));
     });
-    res.json({ variationOrders: rows });
+    res.json({ variationOrders: rows.rows });
   } catch (err) {
     next(err);
   }
@@ -221,33 +203,27 @@ financeRouter.post(
     const { id } = req.data.params;
     const b = req.data.body;
     try {
-      const row = await withTenantTx(req.user.tenantId, async (db) => {
+      const row = await withTenant(req.user.tenantId, async (db) => {
         await loadProject(db, req.user, id);
-        const doc = await db.coll('variation_orders').insertOne({
-          project_id: id,
-          vo_number: b.voNumber,
-          description: b.description,
-          value: money2(b.value),
-          time_impact_days: b.timeImpactDays,
-          status: 'PROPOSED',
-          endorsed_by: null,
-          approved_at: null,
-          created_at: new Date(),
-        });
+        const r = await db.query(
+          `INSERT INTO variation_orders (project_id, vo_number, description, value, time_impact_days)
+           VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+          [id, b.voNumber, b.description, money2(b.value), b.timeImpactDays],
+        );
         await audit(db, {
           actorId: req.user.id,
           actorRole: req.user.role,
           action: 'variation.created',
           entity: 'variation_order',
-          entityId: doc._id,
+          entityId: r.rows[0].id,
           summary: `Variation order ${b.voNumber} proposed (${b.value.toFixed(2)})`,
           detail: b,
         });
-        return doc;
+        return r.rows[0];
       });
-      res.status(201).json({ variationOrder: toRow(row) });
+      res.status(201).json({ variationOrder: row });
     } catch (err) {
-      if (isDuplicateKey(err)) return next(conflict('That variation number already exists on this project'));
+      if (err?.code === '23505') return next(conflict('That variation number already exists on this project'));
       next(err);
     }
   },
@@ -259,26 +235,27 @@ financeRouter.post(
   validate(z.object({ params: z.object({ id: uuidField }) })),
   async (req, res, next) => {
     try {
-      const row = await withTenantTx(req.user.tenantId, async (db) => {
-        const vo = await db.coll('variation_orders').findOne({ _id: req.data.params.id });
+      const row = await withTenant(req.user.tenantId, async (db) => {
+        const vo = (
+          await db.query('SELECT * FROM variation_orders WHERE id = $1', [req.data.params.id])
+        ).rows[0];
         if (!vo) throw notFound('Variation order not found');
         if (vo.status !== 'PROPOSED') throw conflict(`Variation is already ${vo.status.toLowerCase()}`);
-        const doc = await db.coll('variation_orders').findOneAndUpdate(
-          { _id: vo._id },
-          { $set: { status: 'ENDORSED', endorsed_by: req.user.id } },
-          { returnDocument: 'after' },
+        const r = await db.query(
+          `UPDATE variation_orders SET status = 'ENDORSED', endorsed_by = $2 WHERE id = $1 RETURNING *`,
+          [vo.id, req.user.id],
         );
         await audit(db, {
           actorId: req.user.id,
           actorRole: req.user.role,
           action: 'variation.endorsed',
           entity: 'variation_order',
-          entityId: vo._id,
+          entityId: vo.id,
           summary: `Variation order ${vo.vo_number} endorsed`,
         });
-        return doc;
+        return r.rows[0];
       });
-      res.json({ variationOrder: toRow(row) });
+      res.json({ variationOrder: row });
     } catch (err) {
       next(err);
     }
@@ -291,32 +268,28 @@ financeRouter.post(
   validate(z.object({ params: z.object({ id: uuidField }), body: z.object({ decision: z.enum(['APPROVED', 'REJECTED']) }) })),
   async (req, res, next) => {
     try {
-      const row = await withTenantTx(req.user.tenantId, async (db) => {
-        const vo = await db.coll('variation_orders').findOne({ _id: req.data.params.id });
+      const row = await withTenant(req.user.tenantId, async (db) => {
+        const vo = (
+          await db.query('SELECT * FROM variation_orders WHERE id = $1', [req.data.params.id])
+        ).rows[0];
         if (!vo) throw notFound('Variation order not found');
         if (vo.status !== 'ENDORSED') throw conflict('Only an endorsed variation can be decided');
-        const decision = req.data.body.decision;
-        const doc = await db.coll('variation_orders').findOneAndUpdate(
-          { _id: vo._id },
-          {
-            $set: {
-              status: decision,
-              approved_at: decision === 'APPROVED' ? new Date() : null,
-            },
-          },
-          { returnDocument: 'after' },
+        const r = await db.query(
+          `UPDATE variation_orders SET status = $2, approved_at = CASE WHEN $2 = 'APPROVED' THEN now() END
+            WHERE id = $1 RETURNING *`,
+          [vo.id, req.data.body.decision],
         );
         await audit(db, {
           actorId: req.user.id,
           actorRole: req.user.role,
-          action: `variation.${decision.toLowerCase()}`,
+          action: `variation.${req.data.body.decision.toLowerCase()}`,
           entity: 'variation_order',
-          entityId: vo._id,
-          summary: `Variation order ${vo.vo_number} ${decision.toLowerCase()}`,
+          entityId: vo.id,
+          summary: `Variation order ${vo.vo_number} ${req.data.body.decision.toLowerCase()}`,
         });
-        return doc;
+        return r.rows[0];
       });
-      res.json({ variationOrder: toRow(row) });
+      res.json({ variationOrder: row });
     } catch (err) {
       next(err);
     }
@@ -328,7 +301,7 @@ financeRouter.post(
 const fundingSchema = z.object({
   params: z.object({ id: uuidField }),
   body: z.object({
-    sourceName: z.string().trim().min(1).max(160),
+    sourceName: z.string().trim().min(1).max(120),
     funderType: z.enum(['client', 'internal', 'lender', 'other']).default('client'),
     amount: money.nonnegative(),
   }),
@@ -338,50 +311,40 @@ financeRouter.get('/projects/:id/funding', requireCapability('finance.read'), as
   try {
     const rows = await withTenant(req.user.tenantId, async (db) => {
       await loadProject(db, req.user, req.params.id);
-      return (await db.coll('funding_allocations').find(
-        { project_id: req.params.id },
-        { sort: { created_at: 1 } },
-      )).map(toRow);
+      return db.query(`SELECT * FROM funding_allocations WHERE project_id = $1 ORDER BY created_at`, [req.params.id]);
     });
-    res.json({ allocations: rows });
+    res.json({ funding: rows.rows });
   } catch (err) {
     next(err);
   }
 });
 
-financeRouter.post(
-  '/projects/:id/funding',
-  requireCapability('finance.write'),
-  validate(fundingSchema),
-  async (req, res, next) => {
-    const { id } = req.data.params;
-    const b = req.data.body;
-    try {
-      const row = await withTenantTx(req.user.tenantId, async (db) => {
-        await loadProject(db, req.user, id);
-        const doc = await db.coll('funding_allocations').insertOne({
-          project_id: id,
-          source_name: b.sourceName,
-          funder_type: b.funderType,
-          amount: money2(b.amount),
-          created_at: new Date(),
-        });
-        await audit(db, {
-          actorId: req.user.id,
-          actorRole: req.user.role,
-          action: 'funding.created',
-          entity: 'funding_allocation',
-          entityId: doc._id,
-          summary: `Funding source "${b.sourceName}" allocated (${b.amount.toFixed(2)})`,
-        });
-        return doc;
+financeRouter.post('/projects/:id/funding', requireCapability('finance.write'), validate(fundingSchema), async (req, res, next) => {
+  const { id } = req.data.params;
+  const b = req.data.body;
+  try {
+    const row = await withTenant(req.user.tenantId, async (db) => {
+      await loadProject(db, req.user, id);
+      const r = await db.query(
+        `INSERT INTO funding_allocations (project_id, source_name, funder_type, amount)
+         VALUES ($1,$2,$3,$4) RETURNING *`,
+        [id, b.sourceName, b.funderType, money2(b.amount)],
+      );
+      await audit(db, {
+        actorId: req.user.id,
+        actorRole: req.user.role,
+        action: 'funding.created',
+        entity: 'funding_allocation',
+        entityId: r.rows[0].id,
+        summary: `Funding source "${b.sourceName}" allocated (${b.amount.toFixed(2)})`,
       });
-      res.status(201).json({ allocation: toRow(row) });
-    } catch (err) {
-      next(err);
-    }
-  },
-);
+      return r.rows[0];
+    });
+    res.status(201).json({ allocation: row });
+  } catch (err) {
+    next(err);
+  }
+});
 
 financeRouter.delete(
   '/funding/:id',
@@ -389,16 +352,18 @@ financeRouter.delete(
   validate(z.object({ params: z.object({ id: uuidField }) })),
   async (req, res, next) => {
     try {
-      await withTenantTx(req.user.tenantId, async (db) => {
-        const doc = await db.coll('funding_allocations').findOneAndDelete({ _id: req.data.params.id });
-        if (!doc) throw notFound('Allocation not found');
+      await withTenant(req.user.tenantId, async (db) => {
+        const r = await db.query('DELETE FROM funding_allocations WHERE id = $1 RETURNING source_name', [
+          req.data.params.id,
+        ]);
+        if (r.rowCount === 0) throw notFound('Allocation not found');
         await audit(db, {
           actorId: req.user.id,
           actorRole: req.user.role,
           action: 'funding.removed',
           entity: 'funding_allocation',
           entityId: req.data.params.id,
-          summary: `Funding allocation "${doc.source_name}" removed`,
+          summary: `Funding allocation "${r.rows[0].source_name}" removed`,
         });
       });
       res.status(204).end();

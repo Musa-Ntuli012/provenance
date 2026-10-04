@@ -1,8 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { can, canEndorseDomain, isClientRole, STAGES, DOMAINS, ROLE_BY_DOMAIN } from '../src/lib/rbac.js';
-import { clientScopeFilter } from '../src/modules/projects.service.js';
-import { isDuplicateKey } from '../src/db/mongo.js';
+import { clientScopePredicate } from '../src/modules/projects.service.js';
 import { passwordField, slugField } from '../src/lib/fields.js';
 
 test('stage ladder has exactly 11 named stages', () => {
@@ -49,30 +48,22 @@ test('endorsement: a lead may only endorse their own domain', () => {
   assert.equal(ROLE_BY_DOMAIN.GEOTECHNICAL, 'GEOTECHNICAL_LEAD');
 });
 
-test('client scope filter restricts client roles to their organisation', () => {
+test('client scope predicate restricts client roles to their organisation', () => {
   const staff = { role: 'PM' };
   const client = { role: 'CLIENT_APPROVER', clientOrgId: '11111111-1111-1111-1111-111111111111' };
   const clientNoOrg = { role: 'CLIENT_APPROVER', clientOrgId: null };
 
-  assert.deepEqual(clientScopeFilter(staff), {});
+  const s = clientScopePredicate(staff, 'p', 1);
+  assert.equal(s.clause, 'true');
+  assert.deepEqual(s.params, []);
 
-  assert.deepEqual(clientScopeFilter(client), {
-    client_org_id: '11111111-1111-1111-1111-111111111111',
-  });
+  const c = clientScopePredicate(client, 'p', 2);
+  assert.equal(c.clause, 'p.client_org_id = $2');
+  assert.deepEqual(c.params, ['11111111-1111-1111-1111-111111111111']);
 
-  // A client user with no organisation must match nothing at all.
-  const denied = clientScopeFilter(clientNoOrg);
-  assert.deepEqual(denied, { $expr: false });
-
+  assert.equal(clientScopePredicate(clientNoOrg).clause, 'false');
   assert.equal(isClientRole('CLIENT_TEMP'), true);
   assert.equal(isClientRole('PM'), false);
-});
-
-test('duplicate key detection maps the MongoDB codes the unique indexes raise', () => {
-  assert.equal(isDuplicateKey({ code: 11000 }), true);
-  assert.equal(isDuplicateKey({ code: 11001 }), true);
-  assert.equal(isDuplicateKey({ code: 23505 }), false);
-  assert.equal(isDuplicateKey(new Error('other')), false);
 });
 
 test('password policy: length plus at least one letter and digit', () => {

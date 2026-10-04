@@ -1,9 +1,9 @@
 {
   "name": "@provenance/backend",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
-  "description": "PROVENANCE, private-firm engineering project management platform (API, MongoDB)",
+  "description": "PROVENANCE, private-firm engineering project management platform (API, Supabase-compatible PostgreSQL)",
   "engines": {
     "node": ">=20"
   },
@@ -11,11 +11,12 @@
     "dev": "node --watch src/server.js",
     "lint": "eslint .",
     "start": "node src/server.js",
-    "db:migrate": "node src/db/indexes.js",
+    "db:ping": "node src/db/ping.js",
+    "db:bootstrap": "node src/db/bootstrap.js",
+    "db:migrate": "node src/db/migrate.js",
     "db:seed": "node src/db/seed.js",
     "db:setup": "npm run db:migrate && npm run db:seed",
-    "test": "node --test tests/",
-    "db:ping": "node src/db/ping.js"
+    "test": "node --test tests/"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",
@@ -26,8 +27,8 @@
     "express-rate-limit": "^7.4.1",
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.2",
-    "mongodb": "^7.6.0",
     "multer": "^2.0.1",
+    "pg": "^8.13.1",
     "zod": "^3.24.1"
   },
   "devDependencies": {

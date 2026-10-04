@@ -5,7 +5,7 @@ import path from 'node:path';
 import multer from 'multer';
 import { z } from 'zod';
 import { config } from '../config.js';
-import { withTenant, withTenantTx, toRow } from '../db/mongo.js';
+import { withTenant } from '../db/pool.js';
 import { audit } from '../lib/audit.js';
 import { badRequest, notFound } from '../lib/errors.js';
 import { uuidField } from '../lib/fields.js';
@@ -63,29 +63,23 @@ documentsRouter.get(
     try {
       const rows = await withTenant(req.user.tenantId, async (db) => {
         await loadProjectForUser(db, req.user, req.data.params.id);
-        const filter = { project_id: req.data.params.id };
-        if (isClientRole(req.user.role)) filter.category = { $in: CLIENT_VISIBLE_CATEGORIES };
-        const docs = await db.coll('documents').find(filter, { sort: { created_at: -1 } });
-        return attachUploaderNames(db, docs);
+        const base = `SELECT d.*, u.full_name AS uploader_name FROM documents d
+                        LEFT JOIN users u ON u.id = d.uploaded_by
+                       WHERE d.project_id = $1`;
+        if (isClientRole(req.user.role)) {
+          return db.query(`${base} AND d.category = ANY($2::text[]) ORDER BY d.created_at DESC`, [
+            req.data.params.id,
+            CLIENT_VISIBLE_CATEGORIES,
+          ]);
+        }
+        return db.query(`${base} ORDER BY d.created_at DESC`, [req.data.params.id]);
       });
-      res.json({ documents: rows });
+      res.json({ documents: rows.rows });
     } catch (err) {
       next(err);
     }
   },
 );
-
-async function attachUploaderNames(db, docs) {
-  const ids = [...new Set(docs.map((d) => d.uploaded_by).filter(Boolean))];
-  const users = ids.length
-    ? await db.coll('users').find({ _id: { $in: ids } }, { projection: { _id: 1, full_name: 1 } })
-    : [];
-  const uMap = new Map(users.map((u) => [u._id, u.full_name]));
-  return docs.map((d) => ({
-    ...toRow(d),
-    uploader_name: d.uploaded_by ? (uMap.get(d.uploaded_by) ?? null) : null,
-  }));
-}
 
 const uploadFields = upload.single('file');
 
@@ -112,32 +106,35 @@ documentsRouter.post('/', requireCapability('documents.write'), (req, res, next)
     if (!req.file) {
       return next(badRequest('Attach a file to upload', [{ field: 'body.file', message: 'A file is required' }]));
     }
-    const row = await withTenantTx(req.user.tenantId, async (db) => {
+    const row = await withTenant(req.user.tenantId, async (db) => {
       await loadProjectForUser(db, req.user, b.projectId);
-      const doc = await db.coll('documents').insertOne({
-        project_id: b.projectId,
-        category: b.category,
-        title: b.title,
-        file_name: req.file.originalname.slice(0, 200),
-        storage_key: req.file.filename,
-        mime_type: req.file.mimetype,
-        size_bytes: req.file.size,
-        stage_index: b.stageIndex ?? null,
-        uploaded_by: req.user.id,
-        created_at: new Date(),
-      });
+      const r = await db.query(
+        `INSERT INTO documents (project_id, category, title, file_name, storage_key, mime_type, size_bytes, stage_index, uploaded_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        [
+          b.projectId,
+          b.category,
+          b.title,
+          req.file.originalname.slice(0, 200),
+          req.file.filename,
+          req.file.mimetype,
+          req.file.size,
+          b.stageIndex ?? null,
+          req.user.id,
+        ],
+      );
       await audit(db, {
         actorId: req.user.id,
         actorRole: req.user.role,
         action: 'document.uploaded',
         entity: 'document',
-        entityId: doc._id,
+        entityId: r.rows[0].id,
         summary: `Document uploaded, ${b.title}`,
         detail: { category: b.category, size: req.file.size },
       });
-      return doc;
+      return r.rows[0];
     });
-    res.status(201).json({ document: toRow(row) });
+    res.status(201).json({ document: row });
   } catch (err) {
     // Don't orphan the stored file if the row failed.
     unlink(path.join(config.storageDir, req.file?.filename ?? '_')).catch(() => {});
@@ -151,14 +148,15 @@ documentsRouter.get(
   async (req, res, next) => {
     try {
       const doc = await withTenant(req.user.tenantId, async (db) => {
-        const d = await db.coll('documents').findOne({ _id: req.data.params.id });
-        if (!d) throw notFound('Document not found');
-        if (isClientRole(req.user.role) && !CLIENT_VISIBLE_CATEGORIES.includes(d.category)) {
+        const r = await db.query('SELECT * FROM documents WHERE id = $1', [req.data.params.id]);
+        if (r.rowCount === 0) throw notFound('Document not found');
+        const doc = r.rows[0];
+        if (isClientRole(req.user.role) && !CLIENT_VISIBLE_CATEGORIES.includes(doc.category)) {
           throw notFound('Document not found');
         }
         // Confirm the requesting user can reach the parent project.
-        await loadProjectForUser(db, req.user, d.project_id);
-        return d;
+        await loadProjectForUser(db, req.user, doc.project_id);
+        return doc;
       });
       if (!doc.storage_key) throw notFound('This record has no attached file (metadata only)');
       // resolve(): sendFile requires an absolute path; basename() blocks traversal.
@@ -185,18 +183,18 @@ documentsRouter.delete(
   validate(z.object({ params: z.object({ id: uuidField }) })),
   async (req, res, next) => {
     try {
-      const doc = await withTenantTx(req.user.tenantId, async (db) => {
-        const d = await db.coll('documents').findOneAndDelete({ _id: req.data.params.id });
-        if (!d) throw notFound('Document not found');
+      const doc = await withTenant(req.user.tenantId, async (db) => {
+        const r = await db.query('DELETE FROM documents WHERE id = $1 RETURNING *', [req.data.params.id]);
+        if (r.rowCount === 0) throw notFound('Document not found');
         await audit(db, {
           actorId: req.user.id,
           actorRole: req.user.role,
           action: 'document.deleted',
           entity: 'document',
           entityId: req.data.params.id,
-          summary: `Document deleted, ${d.title}`,
+          summary: `Document deleted, ${r.rows[0].title}`,
         });
-        return d;
+        return r.rows[0];
       });
       if (doc.storage_key) {
         unlink(path.join(config.storageDir, path.basename(doc.storage_key))).catch(() => {});
@@ -211,18 +209,25 @@ documentsRouter.delete(
 /** Global document register (Files screen). */
 documentsRouter.get('/', async (req, res, next) => {
   try {
-    const rows = await withTenant(req.user.tenantId, async (db) => {
-      const filter = isClientRole(req.user.role) ? { category: { $in: CLIENT_VISIBLE_CATEGORIES } } : {};
-      const docs = await db.coll('documents').find(filter, { sort: { created_at: -1 }, limit: 200 });
-      const projectIds = [...new Set(docs.map((d) => d.project_id))];
-      const projects = projectIds.length
-        ? await db.coll('projects').find({ _id: { $in: projectIds } }, { projection: { _id: 1, name: 1 } })
-        : [];
-      const pMap = new Map(projects.map((p) => [p._id, p.name]));
-      const withNames = await attachUploaderNames(db, docs);
-      return withNames.map((d) => ({ ...d, project_name: pMap.get(d.project_id) ?? null }));
+    const rows = await withTenant(req.user.tenantId, (db) => {
+      if (isClientRole(req.user.role)) {
+        return db.query(
+          `SELECT d.*, p.name AS project_name, u.full_name AS uploader_name
+             FROM documents d JOIN projects p ON p.id = d.project_id
+             LEFT JOIN users u ON u.id = d.uploaded_by
+            WHERE d.category = ANY($1::text[])
+            ORDER BY d.created_at DESC LIMIT 200`,
+          [CLIENT_VISIBLE_CATEGORIES],
+        );
+      }
+      return db.query(
+        `SELECT d.*, p.name AS project_name, u.full_name AS uploader_name
+           FROM documents d JOIN projects p ON p.id = d.project_id
+           LEFT JOIN users u ON u.id = d.uploaded_by
+          ORDER BY d.created_at DESC LIMIT 200`,
+      );
     });
-    res.json({ documents: rows });
+    res.json({ documents: rows.rows });
   } catch (err) {
     next(err);
   }

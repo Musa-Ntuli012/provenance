@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
-import { withTenant, withTenantTx, isDuplicateKey, toRow } from '../db/mongo.js';
+import { withTenant } from '../db/pool.js';
 import { audit } from '../lib/audit.js';
 import { conflict, notFound } from '../lib/errors.js';
 import { emailField, passwordField, uuidField } from '../lib/fields.js';
@@ -11,31 +11,22 @@ import { validate } from '../middleware/validate.js';
 export const clientsRouter = Router();
 clientsRouter.use(authRequired);
 
-const CLIENT_PROJECTION = {
-  _id: 1, name: 1, org_type: 1, contact_name: 1, contact_email: 1, created_at: 1,
-};
+const READ_COLUMNS = `id, name, org_type, contact_name, contact_email, created_at`;
 
 clientsRouter.get('/', async (req, res, next) => {
   try {
-    const rows = await withTenant(req.user.tenantId, async (db) => {
-      const clients = await db.coll('client_organisations').find({}, { sort: { name: 1 }, projection: CLIENT_PROJECTION });
-      // Project counts and contract value totals per client (LEFT JOIN
-      // semantics: clients without projects show zero / "0").
-      const totals = await db.coll('projects').aggregate([
-        { $group: { _id: '$client_org_id', n: { $sum: 1 }, total: { $sum: { $toDecimal: '$contract_value' } } } },
-      ]);
-      const byClient = new Map(totals.map((t) => [t._id, t]));
-      return clients.map((c) => {
-        const t = byClient.get(c._id);
-        const total = t?.total ? Number(t.total) : 0;
-        return {
-          ...toRow(c),
-          project_count: t?.n ?? 0,
-          total_value: total === 0 ? '0' : total.toFixed(2),
-        };
-      });
-    });
-    res.json({ clients: rows });
+    const rows = await withTenant(req.user.tenantId, (db) =>
+      db.query(
+        `SELECT c.id, c.name, c.org_type, c.contact_name, c.contact_email, c.created_at,
+                COUNT(p.id)::int AS project_count,
+                COALESCE(SUM(p.contract_value), 0)::text AS total_value
+           FROM client_organisations c
+           LEFT JOIN projects p ON p.client_org_id = c.id
+          GROUP BY c.id
+          ORDER BY c.name`,
+      ),
+    );
+    res.json({ clients: rows.rows });
   } catch (err) {
     next(err);
   }
@@ -53,25 +44,23 @@ const createSchema = z.object({
 clientsRouter.post('/', requireCapability('clients.write'), validate(createSchema), async (req, res, next) => {
   const b = req.data.body;
   try {
-    const row = await withTenantTx(req.user.tenantId, async (db) => {
-      const doc = await db.coll('client_organisations').insertOne({
-        name: b.name,
-        org_type: b.orgType,
-        contact_name: b.contactName ?? null,
-        contact_email: b.contactEmail ?? null,
-        created_at: new Date(),
-      });
+    const row = await withTenant(req.user.tenantId, async (db) => {
+      const r = await db.query(
+        `INSERT INTO client_organisations (name, org_type, contact_name, contact_email)
+         VALUES ($1, $2, $3, $4) RETURNING ${READ_COLUMNS}`,
+        [b.name, b.orgType, b.contactName ?? null, b.contactEmail ?? null],
+      );
       await audit(db, {
         actorId: req.user.id,
         actorRole: req.user.role,
         action: 'client.created',
         entity: 'client',
-        entityId: doc._id,
+        entityId: r.rows[0].id,
         summary: `Client added, ${b.name}`,
       });
-      return doc;
+      return r.rows[0];
     });
-    res.status(201).json({ client: toRow(row) });
+    res.status(201).json({ client: row });
   } catch (err) {
     next(err);
   }
@@ -95,45 +84,29 @@ clientsRouter.post('/access', requireCapability('clients.write'), validate(acces
   try {
     const hash = await bcrypt.hash(b.temporaryPassword, 12);
     const expires = b.kind === 'CLIENT_TEMP' ? new Date(Date.now() + (b.expiresInDays ?? 14) * 86400_000) : null;
-    const row = await withTenantTx(req.user.tenantId, async (db) => {
-      const client = await db.coll('client_organisations').findOne({ _id: b.clientId }, { projection: { _id: 1, name: 1 } });
-      if (!client) throw notFound('Client not found');
-      const doc = await db.coll('users').insertOne({
-        email: b.email,
-        password_hash: hash,
-        full_name: b.fullName,
-        role: b.kind,
-        client_org_id: b.clientId,
-        status: 'ACTIVE',
-        access_expires_at: expires,
-        created_at: new Date(),
-        last_login_at: null,
-      });
+    const row = await withTenant(req.user.tenantId, async (db) => {
+      const client = await db.query('SELECT id, name FROM client_organisations WHERE id = $1', [b.clientId]);
+      if (client.rowCount === 0) throw notFound('Client not found');
+      const r = await db.query(
+        `INSERT INTO users (email, password_hash, full_name, role, client_org_id, access_expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id, email, full_name, role, client_org_id, status, access_expires_at, created_at`,
+        [b.email, hash, b.fullName, b.kind, b.clientId, expires],
+      );
       await audit(db, {
         actorId: req.user.id,
         actorRole: req.user.role,
         action: 'client.access_granted',
         entity: 'user',
-        entityId: doc._id,
-        summary: `${b.fullName} granted ${b.kind === 'CLIENT_TEMP' ? 'temporary' : 'standing'} access for ${client.name}`,
+        entityId: r.rows[0].id,
+        summary: `${b.fullName} granted ${b.kind === 'CLIENT_TEMP' ? 'temporary' : 'standing'} access for ${client.rows[0].name}`,
         detail: { clientId: b.clientId, kind: b.kind, expires },
       });
-      return doc;
+      return r.rows[0];
     });
-    res.status(201).json({
-      user: toRow({
-        _id: row._id,
-        email: row.email,
-        full_name: row.full_name,
-        role: row.role,
-        client_org_id: row.client_org_id,
-        status: row.status,
-        access_expires_at: row.access_expires_at,
-        created_at: row.created_at,
-      }),
-    });
+    res.status(201).json({ user: row });
   } catch (err) {
-    if (isDuplicateKey(err)) return next(conflict('That email already has portal access'));
+    if (err?.code === '23505') return next(conflict('That email already has portal access'));
     next(err);
   }
 });
@@ -152,29 +125,30 @@ clientsRouter.patch('/:id', requireCapability('clients.write'), validate(patchSc
   const { id } = req.data.params;
   const b = req.data.body;
   try {
-    const row = await withTenantTx(req.user.tenantId, async (db) => {
-      const $set = {};
-      if (b.name !== undefined) $set.name = b.name;
-      if (b.orgType !== undefined) $set.org_type = b.orgType;
-      if (b.contactName !== undefined) $set.contact_name = b.contactName;
-      if (b.contactEmail !== undefined) $set.contact_email = b.contactEmail;
-      const doc = await db.coll('client_organisations').findOneAndUpdate({ _id: id }, { $set }, {
-        returnDocument: 'after',
-        projection: CLIENT_PROJECTION,
-      });
-      if (!doc) throw notFound('Client not found');
+    const row = await withTenant(req.user.tenantId, async (db) => {
+      const r = await db.query(
+        `UPDATE client_organisations SET
+           name = COALESCE($2, name),
+           org_type = COALESCE($3, org_type),
+           contact_name = COALESCE($4, contact_name),
+           contact_email = COALESCE($5, contact_email)
+         WHERE id = $1
+         RETURNING ${READ_COLUMNS}`,
+        [id, b.name ?? null, b.orgType ?? null, b.contactName ?? null, b.contactEmail ?? null],
+      );
+      if (r.rowCount === 0) throw notFound('Client not found');
       await audit(db, {
         actorId: req.user.id,
         actorRole: req.user.role,
         action: 'client.updated',
         entity: 'client',
         entityId: id,
-        summary: `Client updated, ${b.name ?? doc.name}`,
+        summary: `Client updated, ${b.name ?? r.rows[0].name}`,
         detail: b,
       });
-      return doc;
+      return r.rows[0];
     });
-    res.json({ client: toRow(row) });
+    res.json({ client: row });
   } catch (err) {
     next(err);
   }

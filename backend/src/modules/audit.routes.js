@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { withTenant, toRow } from '../db/mongo.js';
+import { withTenant } from '../db/pool.js';
 import { authRequired, requireCapability } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 
@@ -20,23 +20,29 @@ const listSchema = z.object({
 auditRouter.get('/', validate(listSchema), async (req, res, next) => {
   try {
     const { entity, projectId, limit } = req.data.query;
-    const filter = {};
-    if (entity) filter.entity = entity;
-    if (projectId) filter.entity_id = projectId;
-
-    const rows = await withTenant(req.user.tenantId, async (db) => {
-      const events = await db.coll('audit_events').find(filter, { sort: { created_at: -1 }, limit });
-      const actorIds = [...new Set(events.map((a) => a.actor_id).filter(Boolean))];
-      const actors = actorIds.length
-        ? await db.coll('users').find({ _id: { $in: actorIds } }, { projection: { _id: 1, full_name: 1 } })
-        : [];
-      const uMap = new Map(actors.map((u) => [u._id, u.full_name]));
-      return events.map((a) => ({
-        ...toRow(a),
-        actor_name: a.actor_id ? (uMap.get(a.actor_id) ?? null) : null,
-      }));
-    });
-    res.json({ events: rows });
+    const params = [];
+    const where = ['true'];
+    if (entity) {
+      params.push(entity);
+      where.push(`a.entity = $${params.length}`);
+    }
+    if (projectId) {
+      params.push(projectId);
+      where.push(`a.entity_id = $${params.length}`);
+    }
+    params.push(limit);
+    const rows = await withTenant(req.user.tenantId, (db) =>
+      db.query(
+        `SELECT a.id, a.action, a.entity, a.entity_id, a.summary, a.detail, a.created_at,
+                u.full_name AS actor_name, a.actor_role
+           FROM audit_events a LEFT JOIN users u ON u.id = a.actor_id
+          WHERE ${where.join(' AND ')}
+          ORDER BY a.created_at DESC
+          LIMIT $${params.length}`,
+        params,
+      ),
+    );
+    res.json({ events: rows.rows });
   } catch (err) {
     next(err);
   }

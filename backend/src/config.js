@@ -18,11 +18,10 @@ export const config = {
   isProd: process.env.NODE_ENV === 'production',
   port: Number(process.env.PORT ?? 4000),
 
-  // Single MongoDB connection. MongoDB has no row level security, so tenant
-  // isolation is enforced in the data layer (src/db/mongo.js) with every
-  // query scoped to the caller's tenant, and proven by regression tests.
-  mongodbUri: required('MONGODB_URI'),
-  mongodbDbName: process.env.MONGODB_DB_NAME ?? 'provenance',
+  // Runtime role, every query constrained by row-level security.
+  databaseUrl: required('DATABASE_URL'),
+  // Owner role, migrations and seed only. Must never serve request traffic.
+  databaseUrlAdmin: process.env.DATABASE_URL_ADMIN ?? required('DATABASE_URL'),
 
   jwtSecret: required('JWT_SECRET'),
   jwtTtlSeconds: 15 * 60,
@@ -33,9 +32,21 @@ export const config = {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
-
   uploadMaxBytes: 15 * 1024 * 1024,
 };
+
+function sslFor(uri) {
+  let host = '';
+  try { host = new URL(uri).hostname; } catch { /* validated elsewhere */ }
+  if (!host || host === 'localhost' || host === '127.0.0.1') return undefined;
+  // Managed Postgres (Supabase, pooler endpoints) terminates TLS. Set
+  // PGSSL_ROOT_CERT and tighten this for strict certificate pinning in prod.
+  if (process.env.PGSSL_DISABLE === '1') return undefined;
+  return { rejectUnauthorized: false };
+}
+
+config.dbSsl = sslFor(config.databaseUrl);
+config.dbSslAdmin = sslFor(config.databaseUrlAdmin);
 
 if (config.jwtSecret.length < 32) {
   throw new Error('JWT_SECRET must be at least 32 characters (openssl rand -hex 48)');

@@ -1,31 +1,21 @@
 import { config } from './config.js';
 import { createApp } from './app.js';
-import { connectMongo, closeMongo, mongoDatabase } from './db/mongo.js';
+import { pool, adminPool } from './db/pool.js';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 
 mkdirSync(path.resolve(config.storageDir), { recursive: true });
 
+// Fail fast with an actionable message when the database is unreachable.
 try {
-  await connectMongo();
-  const hello = await mongoDatabase().admin().command({ hello: 1 });
-  if (!hello.setName) {
-    console.error('');
-    console.error('This API requires MongoDB running as a REPLICA SET (every write uses');
-    console.error('transactions), but the server at MONGODB_URI is a standalone instance.');
-    console.error('Fix it one of three ways:');
-    console.error('  1. docker compose up -d                    (from the repo root; starts and');
-    console.error('                                              initiates a replica set automatically)');
-    console.error('  2. Start mongod with: --replSet rs0        then run once in mongosh:');
-    console.error('     rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "localhost:27017" }] })');
-    console.error('  3. Use MongoDB Atlas (free tier works out of the box; see README).');
-    console.error('Then verify with: npm run db:ping');
-    process.exit(1);
-  }
-  console.log(`mongodb connected (${config.mongodbDbName}, replica set ${hello.setName})`);
+  const probe = await import('./db/pool.js');
+  await probe.adminPool.query('SELECT 1');
+  console.log(`database connected (${config.env})`);
 } catch (err) {
-  console.error(`mongodb connection failed: ${err.message}`);
-  console.error('Check MONGODB_URI in backend/.env (see .env.example).');
+  console.error(`database connection failed: ${err.message}`);
+  console.error('Check DATABASE_URL in backend/.env (see .env.example).');
+  console.error('Supabase: use the Session pooler URI (port 5432) and allow your IP');
+  console.error('in the Supabase dashboard (Network access).');
   process.exit(1);
 }
 
@@ -35,9 +25,9 @@ const server = app.listen(config.port, () => {
 });
 
 async function shutdown(signal) {
-  console.log(`${signal} received, closing server and database connection`);
+  console.log(`${signal} received, closing server and database pools`);
   server.close(async () => {
-    await closeMongo().catch(() => {});
+    await Promise.allSettled([pool.end(), adminPool.end()]);
     process.exit(0);
   });
   setTimeout(() => process.exit(1), 8000).unref();

@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import { config } from '../config.js';
-import { withTenant, withTenantTx, withRoot, withRootTx, isDuplicateKey } from '../db/mongo.js';
+import { pool, withTenant, withAdmin } from '../db/pool.js';
 import { audit } from '../lib/audit.js';
 import { conflict, unauthorized } from '../lib/errors.js';
 import { emailField, passwordField, slugField } from '../lib/fields.js';
@@ -25,15 +25,14 @@ const registerLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 20 });
 
 function signAccessToken(user, tenantSlug) {
   return jwt.sign(
-    { sub: user._id ?? user.id, tid: user.tenant_id, role: user.role, slug: tenantSlug },
+    { sub: user.id, tid: user.tenant_id, role: user.role, slug: tenantSlug },
     config.jwtSecret,
     { algorithm: 'HS256', expiresIn: config.jwtTtlSeconds },
   );
 }
 
-/** Refresh token = signed reference to a server-side session document
- *  (opaque, revocable, rotated on every use). No session state lives in the
- *  cookie. */
+/** Refresh token = signed reference to a server-side session row (opaque,
+ *  revocable, rotated on every use). No session state lives in the cookie. */
 function signRefreshToken(sessionId, tenantId) {
   return jwt.sign({ sid: sessionId, tid: tenantId, typ: 'refresh' }, config.jwtSecret, {
     algorithm: 'HS256',
@@ -54,14 +53,12 @@ function setRefreshCookie(res, token) {
 }
 
 async function createSession(db, tenantId, userId, ttlSeconds) {
-  const doc = await db.coll('sessions').insertOne({
-    tenant_id: tenantId,
-    user_id: userId,
-    expires_at: new Date(Date.now() + ttlSeconds * 1000),
-    revoked_at: null,
-    created_at: new Date(),
-  });
-  return doc;
+  const expires = new Date(Date.now() + ttlSeconds * 1000);
+  const row = await db.query(
+    `INSERT INTO sessions (tenant_id, user_id, expires_at) VALUES ($1, $2, $3) RETURNING id, expires_at`,
+    [tenantId, userId, expires],
+  );
+  return row.rows[0];
 }
 
 const registerSchema = z.object({
@@ -76,48 +73,35 @@ const registerSchema = z.object({
   }),
 });
 
-// Public: firm self-registration. Runs on the bootstrap scope because the
-// tenant does not exist yet. Tenant + admin user commit atomically.
+// Public: firm self-registration. Runs on the admin connection because the
+// tenant (and its RLS context) does not exist yet, this is bootstrap.
 authRouter.post('/register', registerLimiter, validate(registerSchema), async (req, res, next) => {
   const b = req.data.body;
   try {
-    const result = await withRootTx(async (db) => {
-      const exists = await db.coll('tenants').findOne({ slug: b.slug });
-      if (exists) throw conflict('That workspace address is taken, try another');
+    const result = await withAdmin(async (db) => {
+      const exists = await db.query('SELECT 1 FROM tenants WHERE slug = $1', [b.slug]);
+      if (exists.rowCount > 0) throw conflict('That workspace address is taken, try another');
 
-      const tenant = await db.coll('tenants').insertOne({
-        name: b.organisationName,
-        slug: b.slug,
-        org_type: 'private_firm',
-        industry: b.industry,
-        contact_name: b.contactName,
-        contact_email: b.contactEmail,
-        workflow_profile: 'EVIDENTIARY_PRIVATE_V11',
-        created_at: new Date(),
-      });
+      const tenant = await db.query(
+        `INSERT INTO tenants (name, slug, industry, contact_name, contact_email)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id, name, slug`,
+        [b.organisationName, b.slug, b.industry, b.contactName, b.contactEmail],
+      );
+      const t = tenant.rows[0];
       const hash = await bcrypt.hash(b.password, 12);
-      const admin = await db.coll('users').insertOne({
-        tenant_id: tenant._id,
-        email: b.contactEmail,
-        password_hash: hash,
-        full_name: b.adminName,
-        role: 'ORG_ADMIN',
-        client_org_id: null,
-        status: 'ACTIVE',
-        access_expires_at: null,
-        created_at: new Date(),
-        last_login_at: null,
-      });
-      return { tenant, adminId: admin._id };
+      const admin = await db.query(
+        `INSERT INTO users (tenant_id, email, password_hash, full_name, role)
+         VALUES ($1, $2, $3, $4, 'ORG_ADMIN') RETURNING id`,
+        [t.id, b.contactEmail, hash, b.adminName],
+      );
+      return { tenant: t, adminId: admin.rows[0].id };
     });
-    res.status(201).json({ tenant: { id: result.tenant._id, name: result.tenant.name, slug: result.tenant.slug } });
+    res.status(201).json({ tenant: { id: result.tenant.id, name: result.tenant.name, slug: result.tenant.slug } });
   } catch (err) {
-    if (isDuplicateKey(err)) {
+    if (err?.code === '23505') {
       // The pre-check inside the transaction normally catches this; this is
       // the simultaneous-registration race.
-      return next(conflict(err.keyPattern?.slug
-        ? 'That workspace address is taken, try another'
-        : 'That email is already registered in this workspace'));
+      return next(conflict('That workspace address or email is already registered'));
     }
     next(err);
   }
@@ -131,15 +115,20 @@ authRouter.post('/login', loginLimiter, validate(loginSchema), async (req, res, 
   const { slug, email, password } = req.data.body;
   try {
     // Tenant resolution is bootstrap (pre-auth, cross-tenant by definition);
-    // everything after this runs inside the tenant scope.
-    const tenant = await withRoot(async (db) => {
-      const t = await db.coll('tenants').findOne({ slug });
-      if (!t) throw unauthorized('Invalid workspace, email or password');
-      return t;
+    // everything after this runs inside the tenant's RLS context.
+    const tenant = await withAdmin(async (db) => {
+      const r = await db.query('SELECT id, name, slug FROM tenants WHERE slug = $1', [slug]);
+      if (r.rowCount === 0) throw unauthorized('Invalid workspace, email or password');
+      return r.rows[0];
     });
 
-    const data = await withTenantTx(tenant._id, async (db) => {
-      const u = await db.coll('users').findOne({ email });
+    const user = await withTenant(tenant.id, async (db) => {
+      const r = await db.query(
+        `SELECT id, tenant_id, email, full_name, role, client_org_id, password_hash, status, access_expires_at
+           FROM users WHERE email = $1`,
+        [email],
+      );
+      const u = r.rows[0];
       // Constant-ish work factor even when the user does not exist.
       const ok = u && u.status === 'ACTIVE' ? await bcrypt.compare(password, u.password_hash) : false;
       if (!ok) throw unauthorized('Invalid workspace, email or password');
@@ -147,30 +136,30 @@ authRouter.post('/login', loginLimiter, validate(loginSchema), async (req, res, 
       if (u.role === 'CLIENT_TEMP' && u.access_expires_at && new Date(u.access_expires_at) < new Date()) {
         throw unauthorized('This temporary client access has expired');
       }
-      await db.coll('users').updateOne({ _id: u._id }, { $set: { last_login_at: new Date() } });
-      const session = await createSession(db, tenant._id, u._id, config.refreshTokenTtlSeconds);
+      await db.query('UPDATE users SET last_login_at = now() WHERE id = $1', [u.id]);
+      const session = await createSession(db, tenant.id, u.id, config.refreshTokenTtlSeconds);
       await audit(db, {
-        actorId: u._id,
+        actorId: u.id,
         actorRole: u.role,
         action: 'auth.login',
         entity: 'user',
-        entityId: u._id,
+        entityId: u.id,
         summary: `${u.full_name} signed in`,
       });
-      return { user: u, sessionId: session._id };
+      return { ...u, sessionId: session.id };
     });
 
-    const accessToken = signAccessToken(data.user, tenant.slug);
-    setRefreshCookie(res, signRefreshToken(data.sessionId, tenant._id));
+    const accessToken = signAccessToken(user, tenant.slug);
+    setRefreshCookie(res, signRefreshToken(user.sessionId, tenant.id));
     res.json({
       accessToken,
       user: {
-        id: data.user._id,
-        email: data.user.email,
-        fullName: data.user.full_name,
-        role: data.user.role,
-        clientOrgId: data.user.client_org_id,
-        tenant: { id: tenant._id, name: tenant.name, slug: tenant.slug },
+        id: user.id,
+        email: user.email,
+        fullName: user.full_name,
+        role: user.role,
+        clientOrgId: user.client_org_id,
+        tenant: { id: tenant.id, name: tenant.name, slug: tenant.slug },
       },
     });
   } catch (err) {
@@ -190,37 +179,43 @@ authRouter.post('/refresh', async (req, res, next) => {
     }
     if (payload.typ !== 'refresh') throw unauthorized();
 
-    const data = await withTenantTx(payload.tid, async (db) => {
-      const session = await db.coll('sessions').findOne({ _id: payload.sid });
+    const data = await withTenant(payload.tid, async (db) => {
+      const s = await db.query(
+        `SELECT id, user_id, expires_at, revoked_at FROM sessions WHERE id = $1`,
+        [payload.sid],
+      );
+      const session = s.rows[0];
       if (!session || session.revoked_at || new Date(session.expires_at) < new Date()) {
         throw unauthorized();
       }
       // Rotation: single-use refresh tokens. Reuse of a rotated token fails here.
-      await db.coll('sessions').updateOne({ _id: session._id }, { $set: { revoked_at: new Date() } });
-      const user = await db.coll('users').findOne(
-        { _id: session.user_id },
-        { projection: { password_hash: 0 } },
+      await db.query('UPDATE sessions SET revoked_at = now() WHERE id = $1', [session.id]);
+      const u = await db.query(
+        `SELECT id, tenant_id, email, full_name, role, client_org_id, status, access_expires_at
+           FROM users WHERE id = $1`,
+        [session.user_id],
       );
+      const user = u.rows[0];
       if (!user || user.status !== 'ACTIVE') throw unauthorized();
       if (user.role === 'CLIENT_TEMP' && user.access_expires_at && new Date(user.access_expires_at) < new Date()) {
         throw unauthorized('This temporary client access has expired');
       }
-      const fresh = await createSession(db, payload.tid, user._id, config.refreshTokenTtlSeconds);
-      const tenant = await db.coll('tenants').findOne({ _id: payload.tid });
-      return { user, session: fresh, tenant };
+      const fresh = await createSession(db, payload.tid, user.id, config.refreshTokenTtlSeconds);
+      const t = await db.query('SELECT id, name, slug FROM tenants WHERE id = $1', [payload.tid]);
+      return { user, session: fresh, tenant: t.rows[0] };
     });
 
     const accessToken = signAccessToken(data.user, data.tenant.slug);
-    setRefreshCookie(res, signRefreshToken(data.session._id, payload.tid));
+    setRefreshCookie(res, signRefreshToken(data.session.id, payload.tid));
     res.json({
       accessToken,
       user: {
-        id: data.user._id,
+        id: data.user.id,
         email: data.user.email,
         fullName: data.user.full_name,
         role: data.user.role,
         clientOrgId: data.user.client_org_id,
-        tenant: { id: data.tenant._id, name: data.tenant.name, slug: data.tenant.slug },
+        tenant: { id: data.tenant.id, name: data.tenant.name, slug: data.tenant.slug },
       },
     });
   } catch (err) {
@@ -236,10 +231,7 @@ authRouter.post('/logout', async (req, res, next) => {
       try {
         const payload = jwt.verify(raw, config.jwtSecret, { algorithms: ['HS256'] });
         await withTenant(payload.tid, (db) =>
-          db.coll('sessions').updateOne(
-            { _id: payload.sid, revoked_at: null },
-            { $set: { revoked_at: new Date() } },
-          ),
+          db.query('UPDATE sessions SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL', [payload.sid]),
         );
       } catch {
         /* already invalid, nothing to revoke */
@@ -255,10 +247,9 @@ authRouter.post('/logout', async (req, res, next) => {
 authRouter.get('/me', authRequired, async (req, res, next) => {
   try {
     const tenant = await withTenant(req.user.tenantId, (db) =>
-      db.coll('tenants').findOne(
-        { _id: req.user.tenantId },
-        { projection: { _id: 1, name: 1, slug: 1, industry: 1, contact_name: 1, contact_email: 1 } },
-      ),
+      db.query('SELECT id, name, slug, industry, contact_name, contact_email FROM tenants WHERE id = $1', [
+        req.user.tenantId,
+      ]),
     );
     res.json({
       user: {
@@ -268,15 +259,14 @@ authRouter.get('/me', authRequired, async (req, res, next) => {
         role: req.user.role,
         clientOrgId: req.user.clientOrgId,
       },
-      tenant: { id: tenant._id, name: tenant.name, slug: tenant.slug, industry: tenant.industry, contact_name: tenant.contact_name, contact_email: tenant.contact_email },
+      tenant: tenant.rows[0],
     });
   } catch (err) {
     next(err);
   }
 });
 
-// Convenience for process shutdown hooks elsewhere.
+// Convenience for pool cleanup on shutdown.
 export async function closePools() {
-  const { closeMongo } = await import('../db/mongo.js');
-  await closeMongo();
+  await Promise.all([pool.end(), globalThis.__adminPoolEnd?.()]);
 }

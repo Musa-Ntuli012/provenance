@@ -1,12 +1,12 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { withTenant, withTenantTx, toRow } from '../db/mongo.js';
+import { withTenant } from '../db/pool.js';
 import { audit } from '../lib/audit.js';
 import { uuidField } from '../lib/fields.js';
 import { authRequired, requireCapability } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import {
-  clientScopeFilter,
+  clientScopePredicate,
   getProjectDetail,
   loadProjectForUser,
   createProject,
@@ -27,87 +27,70 @@ const listSchema = z.object({
   }),
 });
 
-const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
 projectsRouter.get('/', validate(listSchema), async (req, res, next) => {
   try {
     const { domain, status, q } = req.data.query;
-    const rows = await withTenant(req.user.tenantId, async (db) => {
-      const filter = { ...clientScopeFilter(req.user) };
-      if (domain) {
-        const assigned = await db.coll('project_domain_assignments').find(
-          { domain },
-          { projection: { project_id: 1 } },
-        );
-        filter._id = { $in: assigned.map((a) => a.project_id) };
-      }
-      if (status) filter.status = status;
-      if (q) {
-        const rx = new RegExp(escapeRe(q), 'i');
-        filter.$or = [{ name: rx }, { code: rx }, { description: rx }];
-      }
+    const scope = clientScopePredicate(req.user, 'p', 1);
+    const params = [...scope.params];
+    const where = [scope.clause];
 
-      const projects = await db.coll('projects').find(filter, { sort: { created_at: -1 } });
-      const clientIds = [...new Set(projects.map((p) => p.client_org_id).filter(Boolean))];
-      const projectIds = projects.map((p) => p._id);
-      const clients = clientIds.length
-        ? await db.coll('client_organisations').find({ _id: { $in: clientIds } }, { projection: { _id: 1, name: 1 } })
-        : [];
-      const assignments = projectIds.length
-        ? await db.coll('project_domain_assignments').find({ project_id: { $in: projectIds } })
-        : [];
-      const leadIds = [...new Set(assignments.map((a) => a.user_id))];
-      const leadUsers = leadIds.length
-        ? await db.coll('users').find({ _id: { $in: leadIds } }, { projection: { _id: 1, full_name: 1 } })
-        : [];
-      const gates = projectIds.length
-        ? await db.coll('stage_gates').find(
-            { stage_index: { $in: projects.map((p) => p.current_stage_index) }, project_id: { $in: projectIds } },
-            { projection: { project_id: 1, stage_index: 1, status: 1 } },
-          )
-        : [];
+    if (domain) {
+      params.push(domain);
+      where.push(
+        `EXISTS (SELECT 1 FROM project_domain_assignments a WHERE a.project_id = p.id AND a.domain = $${params.length})`,
+      );
+    }
+    if (status) {
+      params.push(status);
+      where.push(`p.status = $${params.length}`);
+    }
+    if (q) {
+      params.push(`%${q}%`);
+      where.push(
+        `(p.name ILIKE $${params.length} OR p.code ILIKE $${params.length} OR p.description ILIKE $${params.length})`,
+      );
+    }
 
-      const cMap = new Map(clients.map((c) => [c._id, c.name]));
-      const uMap = new Map(leadUsers.map((u) => [u._id, u.full_name]));
-      const gateKey = (pid, idx) => `${pid}:${idx}`;
-      const gMap = new Map(gates.map((g) => [gateKey(g.project_id, g.stage_index), g.status]));
-      const domainOrder = DOMAIN_ENUM;
-
-      return projects.map((p) => ({
-        id: p._id,
-        code: p.code,
-        name: p.name,
-        status: p.status,
-        current_stage_index: p.current_stage_index,
-        contract_value: p.contract_value,
-        currency: p.currency,
-        start_date: p.start_date,
-        target_end_date: p.target_end_date,
-        latitude: p.latitude,
-        longitude: p.longitude,
-        client_name: p.client_org_id ? (cMap.get(p.client_org_id) ?? null) : null,
-        leads: assignments
-          .filter((a) => a.project_id === p._id)
-          .sort((a, b) => domainOrder.indexOf(a.domain) - domainOrder.indexOf(b.domain))
-          .map((a) => ({ domain: a.domain, userId: a.user_id, name: uMap.get(a.user_id) ?? null })),
-        gate_status: gMap.get(gateKey(p._id, p.current_stage_index)) ?? null,
-      }));
-    });
-    res.json({ projects: rows });
+    const rows = await withTenant(req.user.tenantId, (db) =>
+      db.query(
+        `SELECT p.id, p.code, p.name, p.status, p.current_stage_index, p.contract_value, p.currency,
+                p.start_date, p.target_end_date, p.latitude, p.longitude,
+                c.name AS client_name,
+                (SELECT json_agg(json_build_object('domain', a.domain, 'userId', u.id, 'name', u.full_name))
+                   FROM project_domain_assignments a JOIN users u ON u.id = a.user_id
+                  WHERE a.project_id = p.id) AS leads,
+                (SELECT g.status FROM stage_gates g
+                  WHERE g.project_id = p.id AND g.stage_index = p.current_stage_index) AS gate_status
+           FROM projects p
+           LEFT JOIN client_organisations c ON c.id = p.client_org_id
+          WHERE ${where.join(' AND ')}
+          ORDER BY p.created_at DESC`,
+        params,
+      ),
+    );
+    res.json({ projects: rows.rows });
   } catch (err) {
     next(err);
   }
 });
 
 /** Gates awaiting the requesting user, feeds the Approvals screen.
- *  (Declared before /:id so "approvals" is never mistaken for an id.) */
+ *  (Declared before /:id so “approvals” is never mistaken for an id.) */
 projectsRouter.get('/approvals/pending', async (req, res, next) => {
   try {
-    const rows = await withTenant(req.user.tenantId, async (db) => {
-      const scope = clientScopeFilter(req.user);
-
+    const rows = await withTenant(req.user.tenantId, (db) => {
+      const scope = clientScopePredicate(req.user, 'p', 1);
+      const params = [...scope.params];
+      let sql;
       if (req.user.role === 'CLIENT_APPROVER') {
-        return pendingFor(db, scope, ['PENDING_CLIENT']);
+        sql = `SELECT p.id, p.code, p.name, c.name AS client_name, p.current_stage_index,
+                      g.stage_index AS pending_stage, g.status
+                 FROM projects p
+                 JOIN stage_gates g ON g.project_id = p.id
+                       AND g.stage_index = p.current_stage_index AND g.status = 'PENDING_CLIENT'
+                 LEFT JOIN client_organisations c ON c.id = p.client_org_id
+                WHERE ${scope.clause} ORDER BY g.opened_at`;
+        return db.query(sql, params);
       }
       const domainByRole = {
         PROFESSIONAL_SERVICES_LEAD: 'PROFESSIONAL_SERVICES',
@@ -116,92 +99,42 @@ projectsRouter.get('/approvals/pending', async (req, res, next) => {
       };
       const domain = domainByRole[req.user.role];
       if (req.user.role === 'ORG_ADMIN' || req.user.role === 'PM') {
-        return pendingFor(db, scope, ['IN_PROGRESS', 'PENDING_CLIENT']);
+        sql = `SELECT p.id, p.code, p.name, c.name AS client_name, p.current_stage_index,
+                      g.stage_index AS pending_stage, g.status
+                 FROM projects p
+                 JOIN stage_gates g ON g.project_id = p.id
+                       AND g.stage_index = p.current_stage_index AND g.status IN ('IN_PROGRESS','PENDING_CLIENT')
+                 LEFT JOIN client_organisations c ON c.id = p.client_org_id
+                WHERE ${scope.clause} ORDER BY g.opened_at`;
+        return db.query(sql, params);
       }
       if (domain) {
-        // Their assigned projects, current gate open, still owed a fresh
-        // endorsement from their domain.
-        const mine = await db.coll('project_domain_assignments').find(
-          { domain, user_id: req.user.id },
-          { projection: { project_id: 1 } },
-        );
-        const projects = mine.length
-          ? await db.coll('projects').find({ ...scope, _id: { $in: mine.map((a) => a.project_id) } }, { projection: { _id: 1, code: 1, name: 1, client_org_id: 1, current_stage_index: 1 } })
-          : [];
-        const clientIds = [...new Set(projects.map((p) => p.client_org_id).filter(Boolean))];
-        const clients = clientIds.length
-          ? await db.coll('client_organisations').find({ _id: { $in: clientIds } }, { projection: { _id: 1, name: 1 } })
-          : [];
-        const cMap = new Map(clients.map((c) => [c._id, c.name]));
-        const out = [];
-        for (const p of projects) {
-          const gate = await db.coll('stage_gates').findOne(
-            { project_id: p._id, stage_index: p.current_stage_index, status: 'IN_PROGRESS' },
-            { sort: { opened_at: 1 } },
-          );
-          if (!gate) continue;
-          const fresh = await db.coll('endorsements').countDocuments({
-            project_id: p._id,
-            stage_index: gate.stage_index,
-            domain,
-            decision: 'ENDORSED',
-            created_at: { $gt: gate.client_reviewed_at ?? new Date(0) },
-          });
-          if (fresh > 0) continue;
-          out.push({
-            id: p._id,
-            code: p.code,
-            name: p.name,
-            client_name: p.client_org_id ? (cMap.get(p.client_org_id) ?? null) : null,
-            current_stage_index: p.current_stage_index,
-            pending_stage: gate.stage_index,
-            status: gate.status,
-          });
-        }
-        return out;
+        params.push(domain);
+        sql = `SELECT p.id, p.code, p.name, c.name AS client_name, p.current_stage_index,
+                      g.stage_index AS pending_stage, g.status
+                 FROM projects p
+                 JOIN stage_gates g ON g.project_id = p.id
+                       AND g.stage_index = p.current_stage_index AND g.status = 'IN_PROGRESS'
+                 LEFT JOIN client_organisations c ON c.id = p.client_org_id
+                WHERE ${scope.clause}
+                  AND EXISTS (SELECT 1 FROM project_domain_assignments a
+                               WHERE a.project_id = p.id AND a.domain = $${params.length}
+                                 AND a.user_id = $${params.length + 1})
+                  AND NOT EXISTS (SELECT 1 FROM endorsements e
+                                   WHERE e.project_id = p.id AND e.stage_index = g.stage_index
+                                     AND e.domain = $${params.length} AND e.decision = 'ENDORSED'
+                                     AND e.created_at > COALESCE(g.client_reviewed_at, to_timestamp(0)))
+                ORDER BY g.opened_at`;
+        params.push(req.user.id);
+        return db.query(sql, params);
       }
-      return [];
+      return Promise.resolve({ rows: [], rowCount: 0 });
     });
-    res.json({ pending: rows });
+    res.json({ pending: rows.rows });
   } catch (err) {
     next(err);
   }
 });
-
-/** Shared shape for admin/PM and client pending lists. */
-async function pendingFor(db, scope, statuses) {
-  const projects = await db.coll('projects').find(scope, {
-    projection: { _id: 1, code: 1, name: 1, client_org_id: 1, current_stage_index: 1 },
-  });
-  const projectIds = projects.map((p) => p._id);
-  const gates = projectIds.length
-    ? await db.coll('stage_gates').find(
-        { project_id: { $in: projectIds }, status: { $in: statuses } },
-        { sort: { opened_at: 1 } },
-      )
-    : [];
-  const clientIds = [...new Set(projects.map((p) => p.client_org_id).filter(Boolean))];
-  const clients = clientIds.length
-    ? await db.coll('client_organisations').find({ _id: { $in: clientIds } }, { projection: { _id: 1, name: 1 } })
-    : [];
-  const pMap = new Map(projects.map((p) => [p._id, p]));
-  const cMap = new Map(clients.map((c) => [c._id, c.name]));
-  return gates
-    .map((g) => {
-      const p = pMap.get(g.project_id);
-      if (!p || g.stage_index !== p.current_stage_index) return null;
-      return {
-        id: p._id,
-        code: p.code,
-        name: p.name,
-        client_name: p.client_org_id ? (cMap.get(p.client_org_id) ?? null) : null,
-        current_stage_index: p.current_stage_index,
-        pending_stage: g.stage_index,
-        status: g.status,
-      };
-    })
-    .filter(Boolean);
-}
 
 projectsRouter.get('/:id', validate(z.object({ params: z.object({ id: uuidField }) })), async (req, res, next) => {
   try {
@@ -243,7 +176,7 @@ const createSchema = z.object({
 
 projectsRouter.post('/', requireCapability('projects.write'), validate(createSchema), async (req, res, next) => {
   try {
-    const project = await withTenantTx(req.user.tenantId, (db) => createProject(db, req.user, req.data.body));
+    const project = await withTenant(req.user.tenantId, (db) => createProject(db, req.user, req.data.body));
     res.status(201).json({ project });
   } catch (err) {
     next(err);
@@ -263,23 +196,26 @@ projectsRouter.patch('/:id', requireCapability('projects.write'), validate(patch
   const { id } = req.data.params;
   const b = req.data.body;
   try {
-    const row = await withTenantTx(req.user.tenantId, async (db) => {
+    const row = await withTenant(req.user.tenantId, async (db) => {
       await loadProjectForUser(db, req.user, id);
-      const $set = {};
-      if (b.description !== undefined) $set.description = b.description;
-      if (b.status !== undefined) $set.status = b.status;
-      if (b.targetEndDate !== undefined) $set.target_end_date = b.targetEndDate;
-      const doc = await db.coll('projects').findOneAndUpdate({ _id: id }, { $set }, { returnDocument: 'after' });
+      const r = await db.query(
+        `UPDATE projects SET
+           description = COALESCE($2, description),
+           status = COALESCE($3, status),
+           target_end_date = CASE WHEN $4 THEN $5 ELSE target_end_date END
+         WHERE id = $1 RETURNING *`,
+        [id, b.description ?? null, b.status ?? null, b.targetEndDate !== undefined, b.targetEndDate ?? null],
+      );
       await audit(db, {
         actorId: req.user.id,
         actorRole: req.user.role,
         action: 'project.updated',
         entity: 'project',
         entityId: id,
-        summary: `Project updated, ${doc.code}`,
+        summary: `Project updated, ${r.rows[0].code}`,
         detail: b,
       });
-      return toRow(doc);
+      return r.rows[0];
     });
     res.json({ project: row });
   } catch (err) {
@@ -304,10 +240,10 @@ projectsRouter.post(
     const { id, stageIndex } = req.data.params;
     const { domain, decision, note } = req.data.body;
     try {
-      const gate = await withTenantTx(req.user.tenantId, (db) =>
+      const gate = await withTenant(req.user.tenantId, (db) =>
         endorseStage(db, req.user, id, stageIndex, domain, decision, note),
       );
-      res.json({ gate: gate ? toRow(gate) : gate });
+      res.json({ gate });
     } catch (err) {
       next(err);
     }
@@ -330,7 +266,7 @@ projectsRouter.post(
     const { id, stageIndex } = req.data.params;
     const { decision, note } = req.data.body;
     try {
-      const result = await withTenantTx(req.user.tenantId, (db) =>
+      const result = await withTenant(req.user.tenantId, (db) =>
         clientStageApproval(db, req.user, id, stageIndex, decision, note),
       );
       res.json(result);

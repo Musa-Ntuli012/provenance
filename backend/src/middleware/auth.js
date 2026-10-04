@@ -1,12 +1,12 @@
 import jwt from 'jsonwebtoken';
 import { config } from '../config.js';
-import { withTenant } from '../db/mongo.js';
+import { withTenant } from '../db/pool.js';
 import { unauthorized, forbidden } from '../lib/errors.js';
 import { can } from '../lib/rbac.js';
 
 /** Attaches `req.user` = { id, tenantId, role, slug, clientOrgId, fullName, email }.
- *  Re-reads the user document each request so disabled accounts and expired
- *  client temporary access take effect immediately (no stale token window). */
+ *  Re-reads the user row each request so disabled accounts and expired
+ *  client-temporary access take effect immediately (no stale token window). */
 export async function authRequired(req, res, next) {
   try {
     const header = req.headers.authorization ?? '';
@@ -20,12 +20,14 @@ export async function authRequired(req, res, next) {
       throw unauthorized('Session expired, please sign in again');
     }
 
-    const user = await withTenant(payload.tid, (db) =>
-      db.coll('users').findOne(
-        { _id: payload.sub },
-        { projection: { password_hash: 0 } },
+    const rows = await withTenant(payload.tid, (db) =>
+      db.query(
+        `SELECT id, tenant_id, email, full_name, role, client_org_id, status, access_expires_at
+           FROM users WHERE id = $1`,
+        [payload.sub],
       ),
     );
+    const user = rows.rows[0];
     if (!user || user.status !== 'ACTIVE') throw forbidden('Account is not active');
 
     if (user.role === 'CLIENT_TEMP' && user.access_expires_at && new Date(user.access_expires_at) < new Date()) {
@@ -33,7 +35,7 @@ export async function authRequired(req, res, next) {
     }
 
     req.user = {
-      id: user._id,
+      id: user.id,
       tenantId: user.tenant_id,
       email: user.email,
       fullName: user.full_name,

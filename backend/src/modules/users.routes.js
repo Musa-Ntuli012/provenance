@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
-import { withTenant, withTenantTx, isDuplicateKey, toRow } from '../db/mongo.js';
+import { withTenant } from '../db/pool.js';
 import { audit } from '../lib/audit.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { emailField, passwordField, uuidField } from '../lib/fields.js';
@@ -12,17 +12,15 @@ export const usersRouter = Router();
 usersRouter.use(authRequired);
 
 // password_hash is deliberately absent from every projection below.
-const SAFE_PROJECTION = {
-  _id: 1, email: 1, full_name: 1, role: 1, client_org_id: 1,
-  status: 1, access_expires_at: 1, created_at: 1, last_login_at: 1,
-};
+const SAFE_COLUMNS =
+  'id, email, full_name, role, client_org_id, status, access_expires_at, created_at, last_login_at';
 
 usersRouter.get('/', requireRole('ORG_ADMIN', 'PM'), async (req, res, next) => {
   try {
     const rows = await withTenant(req.user.tenantId, (db) =>
-      db.coll('users').find({}, { sort: { full_name: 1 }, projection: SAFE_PROJECTION }),
+      db.query(`SELECT ${SAFE_COLUMNS} FROM users ORDER BY full_name`),
     );
-    res.json({ users: rows.map(toRow) });
+    res.json({ users: rows.rows });
   } catch (err) {
     next(err);
   }
@@ -52,31 +50,26 @@ usersRouter.post('/', requireRole('ORG_ADMIN'), validate(createSchema), async (r
   const b = req.data.body;
   try {
     const hash = await bcrypt.hash(b.temporaryPassword, 12);
-    const created = await withTenantTx(req.user.tenantId, async (db) => {
-      const doc = await db.coll('users').insertOne({
-        email: b.email,
-        password_hash: hash,
-        full_name: b.fullName,
-        role: b.role,
-        client_org_id: null,
-        status: 'ACTIVE',
-        access_expires_at: null,
-        created_at: new Date(),
-        last_login_at: null,
-      });
+    const created = await withTenant(req.user.tenantId, async (db) => {
+      const row = await db.query(
+        `INSERT INTO users (email, password_hash, full_name, role)
+         VALUES ($1, $2, $3, $4)
+         RETURNING ${SAFE_COLUMNS}`,
+        [b.email, hash, b.fullName, b.role],
+      );
       await audit(db, {
         actorId: req.user.id,
         actorRole: req.user.role,
         action: 'user.created',
         entity: 'user',
-        entityId: doc._id,
-        summary: `${doc.full_name} joined as ${b.role}`,
+        entityId: row.rows[0].id,
+        summary: `${row.rows[0].full_name} joined as ${b.role}`,
       });
-      return doc;
+      return row.rows[0];
     });
-    res.status(201).json({ user: toRow(created) });
+    res.status(201).json({ user: created });
   } catch (err) {
-    if (isDuplicateKey(err)) return next(conflict('That email is already registered in this workspace'));
+    if (err?.code === '23505') return next(conflict('That email is already registered in this workspace'));
     next(err);
   }
 });
@@ -99,35 +92,33 @@ usersRouter.patch('/:id', requireRole('ORG_ADMIN'), validate(patchSchema), async
       throw badRequest('You cannot change your own role or disable your own account');
     }
 
-    const updated = await withTenantTx(req.user.tenantId, async (db) => {
-      const $set = {};
-      if (role !== undefined) $set.role = role;
-      if (status !== undefined) $set.status = status;
-      const row = await db.coll('users').findOneAndUpdate({ _id: id }, { $set }, {
-        returnDocument: 'after',
-        projection: SAFE_PROJECTION,
-      });
-      if (!row) throw notFound('User not found');
+    const updated = await withTenant(req.user.tenantId, async (db) => {
+      const row = await db.query(
+        `UPDATE users SET
+           role = COALESCE($2, role),
+           status = COALESCE($3, status)
+         WHERE id = $1
+         RETURNING ${SAFE_COLUMNS}`,
+        [id, role ?? null, status ?? null],
+      );
+      if (row.rowCount === 0) throw notFound('User not found');
       await audit(db, {
         actorId: req.user.id,
         actorRole: req.user.role,
         action: role ? 'user.role_changed' : 'user.status_changed',
         entity: 'user',
         entityId: id,
-        summary: `${row.full_name}, ${role ? `role set to ${role}` : `status set to ${status}`}`,
+        summary: `${row.rows[0].full_name}, ${role ? `role set to ${role}` : `status set to ${status}`}`,
         detail: { role, status },
       });
       if (status === 'DISABLED') {
         // Revocation: a disabled account loses live sessions immediately.
-        await db.coll('sessions').updateMany(
-          { user_id: id, revoked_at: null },
-          { $set: { revoked_at: new Date() } },
-        );
+        await db.query('UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [id]);
       }
-      return row;
+      return row.rows[0];
     });
 
-    res.json({ user: toRow(updated) });
+    res.json({ user: updated });
   } catch (err) {
     next(err);
   }
@@ -144,21 +135,18 @@ const passwordSchema = z.object({
 
 usersRouter.post('/me/password', authRequired, validate(passwordSchema), async (req, res, next) => {
   try {
-    await withTenantTx(req.user.tenantId, async (db) => {
-      const u = await db.coll('users').findOne({ _id: req.user.id }, { projection: { password_hash: 1 } });
-      if (!u) throw notFound('User not found');
-      const ok = await bcrypt.compare(req.data.body.currentPassword, u.password_hash);
+    await withTenant(req.user.tenantId, async (db) => {
+      const r = await db.query('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
+      if (r.rowCount === 0) throw notFound('User not found');
+      const ok = await bcrypt.compare(req.data.body.currentPassword, r.rows[0].password_hash);
       if (!ok) {
         throw badRequest('Please check the highlighted fields', [
           { field: 'body.currentPassword', message: 'Current password is incorrect' },
         ]);
       }
       const hash = await bcrypt.hash(req.data.body.newPassword, 12);
-      await db.coll('users').updateOne({ _id: req.user.id }, { $set: { password_hash: hash } });
-      await db.coll('sessions').updateMany(
-        { user_id: req.user.id, revoked_at: null },
-        { $set: { revoked_at: new Date() } },
-      );
+      await db.query('UPDATE users SET password_hash = $2 WHERE id = $1', [req.user.id, hash]);
+      await db.query('UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [req.user.id]);
       await audit(db, {
         actorId: req.user.id,
         actorRole: req.user.role,

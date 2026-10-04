@@ -1,28 +1,41 @@
 /**
- * Connection check: run `npm run db:ping` to verify MONGODB_URI before
- * starting the API. Prints the resolved topology so local vs Atlas problems
- * are obvious at a glance (wrong IP allow-list, bad credentials, missing
- * replica set, and so on).
+ * Connection check: run `npm run db:ping` to verify DATABASE_URL before
+ * starting the API. Prints the resolved target so local vs Supabase problems
+ * are obvious at a glance (wrong host/port, missing IP allow-list entry, bad
+ * password, SSL). Exits non-zero when anything is off.
  */
-import { MongoClient } from 'mongodb';
+import pg from 'pg';
 import { config } from '../config.js';
 
-const masked = config.mongodbUri.replace(/:\/\/([^:/@]+):[^@]*@/, '://$1:****@');
+const masked = (uri) => uri.replace(/:\/\/([^:/@]+):[^@]*@/, '://$1:****@');
 
 try {
-  const client = new MongoClient(config.mongodbUri, { serverSelectionTimeoutMS: 10000 });
+  const client = new pg.Client({ connectionString: config.databaseUrl, ssl: config.dbSsl });
   await client.connect();
-  const hello = await client.db('admin').command({ hello: 1 });
-  console.log(`uri        : ${masked}`);
-  console.log(`topology   : ${hello.setName ? `replica set ${hello.setName}` : 'standalone (transactions will NOT work)'}`);
-  console.log(`writable   : ${hello.isWritablePrimary ? 'yes' : 'no (not a primary)'}`);
-  console.log(`server     : mongod ${hello.maxWireVersion >= 21 ? '7.x' : `wire version ${hello.maxWireVersion}`} (MongoDB 7+ required)`);
-  const ok = hello.setName && hello.isWritablePrimary;
-  console.log(ok ? '\nREADY: replica set primary reachable, transactions available.' : '\nNOT READY: see above (a replica set is required for transactions).');
-  process.exitCode = ok ? 0 : 1;
-  await client.close();
+  const { rows } = await client.query('select version(), current_database(), current_user');
+  const rls = await client.query(
+    `select count(*)::int AS n from pg_tables
+      where schemaname = 'public' and rowsecurity = true`,
+  );
+  const tables = await client.query(
+    `select count(*)::int AS n from pg_tables where schemaname = 'public'`,
+  );
+  console.log(`uri        : ${masked(config.databaseUrl)}`);
+  console.log(`server     : ${rows[0].version.split(' ').slice(0, 2).join(' ')} (Postgres 15+ required)`);
+  console.log(`database   : ${rows[0].current_database} (connected as ${rows[0].current_user})`);
+  console.log(`tls        : ${config.dbSsl ? 'yes' : 'no (local connection)'}`);
+  if (tables.rows[0].n === 0) {
+    console.log('schema     : none yet (run: npm run db:migrate)');
+  } else {
+    console.log(`schema     : ${tables.rows[0].n} tables, ${rls.rows[0].n} with row-level security`);
+  }
+  const ready = rows[0].version.includes('PostgreSQL') && Number(rows[0].version.match(/PostgreSQL (\d+)/)?.[1] ?? 0) >= 15;
+  console.log(ready ? '\nREADY: database reachable. If the schema shows 0 tables, run npm run db:setup.' : '\nNOT READY: Postgres 15+ required.');
+  process.exitCode = ready ? 0 : 1;
+  await client.end();
 } catch (err) {
   console.error(`FAILED: ${err.message}`);
-  console.error('Checklist: instance running? IP allow-list (Atlas)? credentials URL-encoded? replicaSet parameter present?');
+  console.error('Checklist: instance running (local) or project active (Supabase)? IP allow-list set');
+  console.error('(Supabase Network access)? password correct and URL-encoded? Session pooler URI (port 5432)?');
   process.exit(1);
 }

@@ -1,7 +1,7 @@
 # PROVENANCE ⇄ EVIDENTIARY v2.1.0, Reconciliation Register
 
 How the logic in [EVIDENTIARY-v2.1.0-LOGIC.md](EVIDENTIARY-v2.1.0-LOGIC.md) maps onto
-the PROVENANCE build in this repository (MongoDB + Vite). Status as of the date of
+the PROVENANCE build in this repository (Supabase PostgreSQL + Vite). Status as of the date of
 this commit. "Partial" means the principle is live in code but narrower than the rule.
 
 ***

@@ -13,58 +13,52 @@ Private-firm engineering delivery governance. Companion docs:
 │  Vite + React 18 (TS)      │  /api  │  Express 4 (ESM, Node 20)        │
 │  = same-origin fetch ======┼=======▶│  helmet · rate-limit · zod · jwt │
 │  token in memory only      │ proxy  │                                  │
-│  httpOnly refresh cookie   │        │  routes → services (scoped db)   │
-└============================┘        │  withTenant()/withTenantTx() ====┼==┐
+│  httpOnly refresh cookie   │        │  routes → services (SQL only)    │
+└============================┘        │  withTenant() tx wrapper ========┼==┐
                                       └==================================┘  │
                                                                             ▼
                                                             ┌==========================┐
-                                                            │  MongoDB 7 replica set   │
-                                                            │  tenant-scoped handles   │
-                                                            │  transactions on writes  │
+                                                            │  PostgreSQL 17           │
+                                                            │  provenance_app (RLS)    │
+                                                            │  provenance_owner (DDL)  │
                                                             └==========================┘
 ```
 
 * **One origin in development**: the browser talks only to Vite (5173); Vite proxies
   `/api` → Express (4000). In production a reverse proxy (or `VITE_API_BASE_URL` for
   split deploys) provides the same shape.
-* **No ODM.** Every query goes through the explicit tenant-scoped data layer in
-  `db/mongo.js`, reviewable as code (OWASP A04 posture).
+* **No ORM.** Every query is a parameterised SQL statement in a service module,
+  reviewable as code (OWASP A04 posture).
 
 ## 2. Trust boundaries & tenant isolation
 
-MongoDB has no row-level security, so isolation is enforced in exactly one place:
-the tenant-scoped data layer (`src/db/mongo.js`).
+Two database roles with different trust levels:
 
-| Scope | Trust | Used for |
+| Role | Trust | Used for |
 |---|---|---|
-| `withRoot` / `withRootTx` | Unscoped (bootstrap only) | Registration, login tenant lookup, seed |
-| `withTenant` / `withTenantTx` | Tenant predicate injected into every query, insert and aggregation; route code never sees a raw collection | All request traffic |
+| `provenance_owner` | Bypasses RLS (owns tables) | Migrations, seed, registration, login tenant lookup |
+| `provenance_app` | Bound by RLS on every tenant table | All request traffic |
 
 Request lifecycle for tenant-scoped data:
 
 ```
-request → authRequired (verify HS256 JWT, re-read user document, expiry checks)
-        → withTenant(tenantId, async db => { … })      == causal session
-        →   service code (every db.coll() call is tenant-predicated)
-        →   audit(...)                                 == same transaction (writes)
-        → COMMIT / ROLLBACK                            == withTenantTx on write paths
+request → authRequired (verify HS256 JWT, re-read user row, expiry checks)
+        → withTenant(tenantId, async db => { … })   == BEGIN
+        →   set_config('app.tenant_id', $tid, true) == transaction-local context
+        →   service SQL (all reads/writes filtered by RLS)
+        →   audit(...)                              == same transaction
+        → COMMIT / ROLLBACK
 ```
 
 Defense in depth:
 
-1. **The scope is the only door.** Every collection method merges the tenant
-   predicate into filters, stamps inserts and prepends the match stage to
-   aggregations before anything reaches MongoDB, cross-tenant access is
-   structurally impossible from route code, and the behavioural suite proves
-   it live (foreign tenant contexts return zero rows and masked 404s).
-2. Inserts are stamped by the scope too, so a document cannot be written
-   without its tenant.
+1. **RLS policies** (`tenant_id = current_setting('app.tenant_id')`) make cross-tenant
+   reads/writes physically impossible for the runtime role, app bugs cannot leak rows.
+2. `tenant_id` columns default to the session context, so an insert cannot "forget" it.
 3. Services additionally scope by resource (e.g. client-organisation users are
    constrained to their client's projects via explicit predicates).
-4. Bootstrap paths (register/login) use the unscoped root scope explicitly and touch no
+4. Bootstrap paths (register/login) use the owner connection explicitly and touch no
    request-scoped data.
-5. Multi-document writes (a change plus its audit entry) run in one transaction
-   with transient-conflict retry, so they commit or roll back together.
 
 ## 3. Authorisation model
 
@@ -131,11 +125,12 @@ range-checked by Zod, rendered through DM Mono tabular figures.
 src/
 ├== config.js               env parsing, fail-fast (prod requires real values)
 ├== app.js                  helmet · cors allow-list · rate-limit · routes · errors
-├== server.js               listen + graceful shutdown (connection closed)
+├== server.js               listen + graceful shutdown (pools closed)
 ├== db/
-│   ├== mongo.js            client + tenant-scoped data layer (the isolation boundary)
-│   ├== indexes.js          collections + indexes (db:migrate, idempotent)
-│   └== seed.js             demo tenant (idempotent, dev passwords only)
+│   ├== pool.js             two pools + withTenant()/withAdmin() transaction wrappers
+│   ├== migrate.js          ordered SQL migrations in schema_migrations
+│   ├== seed.js             demo tenant (idempotent, dev passwords only)
+│   └== migrations/001_init.sql
 ├== lib/  rbac.js · errors.js · fields.js · audit.js
 ├== middleware/  auth.js · validate.js (zod) · error.js (generic-out, detailed-log)
 └== modules/
@@ -154,9 +149,8 @@ src/
 
 ## 8. CI/CD
 
-GitHub Actions (`.github/workflows/ci.yml`): backend job runs **against a real
-MongoDB 7 replica set** with the same tenant-scoped data layer, lint → migrate →
-seed → tests; frontend job
+GitHub Actions (`.github/workflows/ci.yml`): backend job runs **on a real Postgres 17
+service** with the same two-role model, lint → migrate → seed → tests; frontend job
 lints, type-checks and builds; plus SCA (`npm audit`), secrets (gitleaks), SAST
 (semgrep). Dependabot covers both npm projects, the actions, and the Docker image.
 See the workflow header for which jobs are currently advisory vs blocking.
